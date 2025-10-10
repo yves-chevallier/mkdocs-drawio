@@ -1,35 +1,60 @@
-import re
+"""MkDocs Drawio Plugin"""
+
+from __future__ import annotations
+
 import json
-import string
 import logging
-from lxml import etree
-from typing import Dict
+import re
+import socket
+import string
+import urllib.error
+import urllib.request
 from html import escape
 from pathlib import Path
+from typing import TYPE_CHECKING, Dict, Optional, cast
+
 from bs4 import BeautifulSoup
-from mkdocs.utils import copy_file
-from mkdocs.plugins import BasePlugin
-from mkdocs.config import base, config_options as c
+from lxml import etree
+from mkdocs.config import base
+from mkdocs.config import config_options as c
 from mkdocs.exceptions import ConfigurationError
+from mkdocs.plugins import BasePlugin
+from mkdocs.utils import copy_file
+
+if TYPE_CHECKING:
+    from mkdocs.config.defaults import MkDocsConfig
+    from mkdocs.structure.pages import Page
 
 SUB_TEMPLATE = string.Template(
-    '<div class="mxgraph" style="max-width:100%;border:1px solid transparent;" data-mxgraph="$config"></div>'
+    '<div class="mxgraph" style="max-width:100%;border:1px solid transparent;"'
+    ' data-mxgraph="$config"></div>'
 )
 
-LOGGER = logging.getLogger("mkdocs.plugins.diagrams")
+LOGGER = logging.getLogger("mkdocs.plugins.drawio")
 
 
 class DrawioConfig(base.Config):
     """Configuration options for the Drawio Plugin"""
 
+    # Viewer is required to convert the XML to SVG in the browser
+    # Default to the online viewer, but can be overridden with a local copy
+    # Be careful, new drawio versions may break compatibility if the viewer
+    # is not updated accordingly.
     viewer_js = c.Type(
         str, default="https://viewer.diagrams.net/js/viewer-static.min.js"
     )
-    toolbar = c.Type(bool, default=True)
-    tooltips = c.Type(bool, default=True)
-    border = c.Type(int, default=0)
-    edit = c.Type(bool, default=True)
-    darkmode = c.Type(bool, default=False)
+
+    # Allow hovering toolbar for zoom and pan. Typical options are
+    # pages zoom layers lightbox
+    toolbar = c.Type(str, default="")
+
+    # Show tooltips when hovering over diagram elements
+    tooltips = c.Type(bool, default=False)
+
+    # Border width around the diagram in pixels
+    border = c.Type(int, default=5)
+    edit = c.Type(bool, default=False)
+    darkmode = c.Type(bool, default=True)
     use_page_attribute = c.Type(bool, default=False)
 
 
@@ -38,50 +63,66 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
     Plugin for embedding Drawio Diagrams into your MkDocs
     """
 
-    def on_post_page(self, output_content, config, page, **kwargs):
-        return self.render_drawio_diagrams(output_content, page)
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = Path(__file__).parent
+        self.css = []
+        self.js = []
 
-    def render_drawio_diagrams(self, output_content, page):
-        if ".drawio" not in output_content.lower():
-            return output_content
+        self._remote_viewer_url: Optional[str] = None
+        self._viewer_local_rel: str = "js/viewer-static.min.js"
 
-        soup = BeautifulSoup(output_content, "html.parser")
+    def on_post_page(
+        self, output: str, /, *, page: Page, config: MkDocsConfig
+    ) -> str | None:
+        """Replace images with drawio extension with embedded diagrams"""
+
+        if ".drawio" not in output.lower():
+            return output
+
+        soup = BeautifulSoup(output, "html.parser")
 
         diagram_config = {
-            "toolbar": "zoom" if self.config.toolbar else None,
+            "toolbar": self.config.toolbar if self.config.toolbar else None,
             "tooltips": "1" if self.config.tooltips else "0",
-            "border": self.config.border + 5,
+            "border": self.config.border,
             "resize": "1",
-            "edit": "_blank" if self.config.edit else None,
+            "lightbox": 1
         }
+        if self.config.edit:
+            diagram_config["edit"] = "_blank"
+
+        # diagram_config["toolbar"] = "pages zoom layers lightbox"
 
         # search for images using drawio extension
         diagrams = soup.find_all(
-            "img", src=re.compile(r".*\.drawio(.svg)?$", re.IGNORECASE)
+            "img", src=re.compile(r"\.drawio(?:\.svg)?(?:$|\?)", re.IGNORECASE)
         )
         if len(diagrams) == 0:
-            return output_content
-
-        # add drawio library to body
-        lib = soup.new_tag("script", src=self.config.viewer_js)
-        soup.body.append(lib)
+            return output
 
         # substitute images with embedded drawio diagram
-        path = Path(page.file.abs_dest_path).parent
+        dst_path = Path(page.file.abs_dest_path).parent
 
         for diagram in diagrams:
-            if re.search("^https?://", diagram["src"]):
+            src = cast(str, diagram["src"])
+            if re.search("^https?://", src):
                 mxgraph = BeautifulSoup(
-                    DrawioPlugin.substitute_with_url(diagram_config, diagram["src"]),
+                    DrawioPlugin.substitute_with_url(diagram_config, src),
                     "html.parser",
                 )
             else:
-                diagram_page = diagram.get(
-                    "page" if self.config.use_page_attribute else "alt"
+                diagram_page = cast(
+                    Optional[str],
+                    diagram.get("page" if self.config.use_page_attribute else "alt"),
                 )
+                if diagram_page:
+                    diagram_config["page"] = int(diagram_page)
+                    diagram_page = None
+
                 mxgraph = BeautifulSoup(
                     DrawioPlugin.substitute_with_file(
-                        diagram_config, path, diagram["src"], diagram_page
+                        diagram_config, dst_path, src, diagram_page
                     ),
                     "html.parser",
                 )
@@ -92,58 +133,95 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
 
     @staticmethod
     def substitute_with_url(config: Dict, url: str) -> str:
+        """Substitute diagram with URL"""
         config["url"] = url
 
-        return SUB_TEMPLATE.substitute(config=escape(json.dumps(config)))
+        cfg = {k: v for k, v in config.items() if v is not None}
+        return SUB_TEMPLATE.substitute(config=escape(json.dumps(cfg)))
 
     @staticmethod
-    def substitute_with_file(config: Dict, path: Path, src: str, page: str) -> str:
+    def substitute_with_file(
+        config: Dict, path: Path, src: str, page: str | None
+    ) -> str:
+        """Substitute diagram with local file"""
         try:
-            diagram_xml = etree.parse(path.joinpath(src).resolve())
-        except Exception:
+            safe_parser = etree.XMLParser(resolve_entities=False, no_network=True)
+            diagram_xml = etree.parse(path.joinpath(src).resolve(), parser=safe_parser)
+        except etree.XMLSyntaxError:
             LOGGER.error(
-                f"Error: Provided diagram file '{src}' on path "
-                f"'{path}' is not a valid diagram"
+                "Error: Provided diagram file '%s' on path '%s' is not a valid XML",
+                src,
+                path,
+            )
+            diagram_xml = etree.fromstring("<invalid/>")
+        except OSError:
+            LOGGER.error(
+                "Error: Could not find diagram file '%s' on path '%s'",
+                src,
+                path,
             )
             diagram_xml = etree.fromstring("<invalid/>")
 
         diagram = DrawioPlugin.parse_diagram(diagram_xml, page, src, path)
         config["xml"] = diagram
-
         return SUB_TEMPLATE.substitute(config=escape(json.dumps(config)))
 
     @staticmethod
     def parse_diagram(data, page, src="", path=None) -> str:
-        if page is None or len(page) == 0:
-            return etree.tostring(data, encoding=str)
-        try:
-            mxfile = data.xpath("//mxfile")[0]
+        """Extract page from diagram XML data"""
+        if not page:
+            return etree.tostring(data, encoding="unicode")
 
-            # try to parse for a specific page by using the page attribute
-            pages = mxfile.xpath(f"//diagram[@name='{page}']")
+        try:
+            mxfile_nodes = data.xpath("//mxfile")
+            if not mxfile_nodes:
+                LOGGER.error("Error: No <mxfile> root in '%s' (path '%s')", src, path)
+                return ""
+            mxfile = mxfile_nodes[0]
+
+            pages = mxfile.xpath(f"./diagram[@name={json.dumps(page)}]")
+            if not pages:
+                LOGGER.warning(
+                    "Warning: No page named '%s' in '%s' (path '%s')", page, src, path
+                )
+                return etree.tostring(mxfile, encoding="unicode")
 
             if len(pages) > 1:
                 LOGGER.warning(
-                    f"Warning: Found multiple ({len(pages)}) pages with "
-                    f"same name '{page}' in diagram '{src}' "
-                    f"on path '{path}', using first one."
+                    "Warning: Found multiple (%d) pages named '%s' "
+                    "in '%s' (path '%s'); using first.",
+                    len(pages),
+                    page,
+                    src,
+                    path,
                 )
-                return etree.tostring(mxfile, encoding=str)
 
-            parser = etree.XMLParser()
-            result = parser.makeelement(mxfile.tag, mxfile.attrib)
-
+            # Keep attributes from mxfile
+            result = etree.Element(mxfile.tag, **mxfile.attrib)
             result.append(pages[0])
-            return etree.tostring(result, encoding=str)
+            return etree.tostring(result, encoding="unicode")
 
-        except Exception:
+        except (etree.XPathEvalError, etree.XPathSyntaxError) as e:
             LOGGER.error(
-                "Error: Could not properly parse page name "
-                f"'{page}' for diagram '{src}' on path '{path}'"
+                "XPath error parsing page '%s' in '%s' (path '%s'): %s",
+                page,
+                src,
+                path,
+                e,
             )
+
+        except (TypeError, ValueError, AttributeError) as e:
+            LOGGER.error(
+                "Invalid XML structure for page '%s' in '%s' (path '%s'): %s",
+                page,
+                src,
+                path,
+                e,
+            )
+
         return ""
 
-    def on_config(self, config: base.Config):
+    def on_config(self, config: MkDocsConfig) -> None:
         """Load embedded files"""
         if not self.config.use_page_attribute and not self._has_attr_list_extension(
             config.get("markdown_extensions", [])
@@ -153,10 +231,22 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
                 "when 'use_page_attribute' is set to false."
             )
 
-        self.base = Path(__file__).parent
-        self.css = []
-        self.js = []
+        # Determine if we need to download the viewer JS
+        viewer = self.config.viewer_js
+        if isinstance(viewer, str) and viewer.startswith(("http://", "https://")):
+            self._remote_viewer_url = viewer
+            # Reference local path where we will save the downloaded file
+            self.js.append(self._viewer_local_rel)
+        else:
+            # Assume it's a local path relative to the docs site
+            self.js.append(viewer)
 
+        # Mandatory for reloading diagrams when navigating with
+        # Mkdocs-Material which has an observable event listener
+        self.js.append("js/drawio-reload.js")
+
+        # Ensure that after the reload script, the darkmode script is loaded
+        # if following the current theme mode of the site is desired
         if self.config.darkmode:
             self.css.append("css/drawio-darkmode.css")
             self.js.append("js/drawio-darkmode.js")
@@ -166,11 +256,57 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
         for path in self.js:
             config.extra_javascript.append(str(path))
 
-    def on_post_build(self, config: base.Config) -> None:
+    def on_post_build(self, *, config: MkDocsConfig) -> None:
         """Copy embedded files to the site directory"""
         site = Path(config["site_dir"])
+
+        # Copy embedded CSS and JS files
         for path in self.css + self.js:
-            copy_file(self.base / path, site / path)
+            p = self.base / path
+            if p.exists():
+                copy_file(p, site / path)
+
+        # Download the Drawio viewer JS if needed
+        if self._remote_viewer_url:
+            dest = site / self._viewer_local_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                req = urllib.request.Request(
+                    self._remote_viewer_url,
+                    headers={"User-Agent": "Mozilla/5.0 (MkDocs Drawio Plugin)"},
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = resp.read()
+                with open(dest, "wb") as f:
+                    f.write(data)
+                LOGGER.info("Downloaded Drawio viewer to %s", dest)
+
+            except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout) as e:
+                LOGGER.warning(
+                    "Could not download viewer from %s: %s. "
+                    "Using runtime fallback to remote URL.",
+                    self._remote_viewer_url,
+                    e,
+                )
+                stub = (
+                    "/*! drawio viewer fallback stub */\n"
+                    "(function(){"
+                    f"var s=document.createElement('script');"
+                    f"s.src={json.dumps(self._remote_viewer_url)};"
+                    "document.head.appendChild(s);"
+                    "})();\n"
+                )
+                dest.write_text(stub, encoding="utf-8")
+            except (OSError, PermissionError) as e:
+                LOGGER.error("Filesystem error writing viewer to %s: %s", dest, e)
+                raise
+
+            except Exception as e:
+                LOGGER.exception(
+                    "Unexpected error while downloading Drawio viewer: %s", e
+                )
+                raise
 
     @staticmethod
     def _has_attr_list_extension(extensions) -> bool:
