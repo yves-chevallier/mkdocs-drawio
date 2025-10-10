@@ -6,12 +6,10 @@ import json
 import logging
 import re
 import socket
-import string
 import urllib.error
 import urllib.request
-from html import escape
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from bs4 import BeautifulSoup
 from lxml import etree
@@ -25,13 +23,29 @@ if TYPE_CHECKING:
     from mkdocs.config.defaults import MkDocsConfig
     from mkdocs.structure.pages import Page
 
-SUB_TEMPLATE = string.Template(
-    '<div class="mxgraph" style="max-width:100%;border:1px solid transparent;"'
-    ' data-mxgraph="$config"></div>'
-)
+
+IMG_RE = re.compile(r"""
+    (!\[[^\]]*]                # ![alt]
+     \(                        # (
+       (?P<src>[^)\s]+         #   src
+          \.drawio(?:\.svg)?   #   .drawio ou .drawio.svg
+       )
+       (?:\s+"[^"]*")?         #   "title" (optionnel)
+     \)                        # )
+    )
+    (?P<attrs>\s*\{[^}]*\})?   # { ... } attributs (optionnels)
+""", re.VERBOSE)
 
 LOGGER = logging.getLogger("mkdocs.plugins.drawio")
 
+def _add_classes_to_match(m, classes):
+    class_str = " ".join(f".{c}" for c in classes)
+    if m.group("attrs"):
+        # On insère avant la '}' de fin
+        attrs = m.group("attrs").rstrip("}")
+        return f"{m.group(1)}{attrs} {class_str}}}"
+    else:
+        return f"{m.group(1)}{{ {class_str} }}"
 
 class DrawioConfig(base.Config):
     """Configuration options for the Drawio Plugin"""
@@ -53,8 +67,11 @@ class DrawioConfig(base.Config):
 
     # Border width around the diagram in pixels
     border = c.Type(int, default=5)
+
+    # Allow editing the diagram in a new lightbox window
     edit = c.Type(bool, default=False)
-    darkmode = c.Type(bool, default=True)
+
+    # Choose the page number to display from the diagram
     use_page_attribute = c.Type(bool, default=False)
 
 
@@ -69,13 +86,22 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
         self.css = []
         self.js = []
 
+        self.attr_list_enabled = False
         self._remote_viewer_url: Optional[str] = None
         self._viewer_local_rel: str = "js/viewer-static.min.js"
+
+    def on_page_markdown(self, markdown: str, /, **_kwargs) -> str | None:
+        """Add class to images with drawio extension for preventing glightbox to
+        patch them."""
+        if not self.attr_list_enabled:
+            return markdown
+        return IMG_RE.sub(lambda m: _add_classes_to_match(m, ["off-glb"]), markdown)
 
     def on_post_page(
         self, output: str, /, *, page: Page, config: MkDocsConfig
     ) -> str | None:
         """Replace images with drawio extension with embedded diagrams"""
+
 
         if ".drawio" not in output.lower():
             return output
@@ -87,7 +113,8 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
             "tooltips": "1" if self.config.tooltips else "0",
             "border": self.config.border,
             "resize": "1",
-            "lightbox": 1
+            "lightbox": 1,
+            "appearance": "automatic"
         }
         if self.config.edit:
             diagram_config["edit"] = "_blank"
@@ -101,70 +128,40 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
         if len(diagrams) == 0:
             return output
 
-        # substitute images with embedded drawio diagram
-        dst_path = Path(page.file.abs_dest_path).parent
+        style_val = "max-width:100%;border:1px solid transparent;"
 
         for diagram in diagrams:
             src = cast(str, diagram["src"])
-            if re.search("^https?://", src):
-                mxgraph = BeautifulSoup(
-                    DrawioPlugin.substitute_with_url(diagram_config, src),
-                    "html.parser",
-                )
-            else:
-                diagram_page = cast(
-                    Optional[str],
-                    diagram.get("page" if self.config.use_page_attribute else "alt"),
-                )
-                if diagram_page:
-                    diagram_config["page"] = int(diagram_page)
-                    diagram_page = None
 
-                mxgraph = BeautifulSoup(
-                    DrawioPlugin.substitute_with_file(
-                        diagram_config, dst_path, src, diagram_page
-                    ),
-                    "html.parser",
-                )
+            diagram_page = cast(
+                Optional[str],
+                diagram.get("page" if self.config.use_page_attribute else "alt"),
+            )
+
+            cfg = {
+                k: v
+                for k, v in {
+                    "toolbar": self.config.toolbar or None,
+                    "tooltips": str(int(self.config.tooltips)),
+                    "border": self.config.border,
+                    "resize": "1",
+                    "lightbox": 1,
+                    "appearance": "automatic",
+                    "url": src,
+                    **({"edit": "_blank"} if self.config.edit else {}),
+                    **({"page": diagram_page} if diagram_page else {}),
+                }.items()
+                if v is not None
+            }
+
+            mxgraph = soup.new_tag("div")
+            mxgraph["class"] = "mxgraph"
+            mxgraph["style"] = style_val
+            mxgraph["data-mxgraph"] = json.dumps(cfg, separators=(",", ":"))
 
             diagram.replace_with(mxgraph)
 
         return str(soup)
-
-    @staticmethod
-    def substitute_with_url(config: Dict, url: str) -> str:
-        """Substitute diagram with URL"""
-        config["url"] = url
-
-        cfg = {k: v for k, v in config.items() if v is not None}
-        return SUB_TEMPLATE.substitute(config=escape(json.dumps(cfg)))
-
-    @staticmethod
-    def substitute_with_file(
-        config: Dict, path: Path, src: str, page: str | None
-    ) -> str:
-        """Substitute diagram with local file"""
-        try:
-            safe_parser = etree.XMLParser(resolve_entities=False, no_network=True)
-            diagram_xml = etree.parse(path.joinpath(src).resolve(), parser=safe_parser)
-        except etree.XMLSyntaxError:
-            LOGGER.error(
-                "Error: Provided diagram file '%s' on path '%s' is not a valid XML",
-                src,
-                path,
-            )
-            diagram_xml = etree.fromstring("<invalid/>")
-        except OSError:
-            LOGGER.error(
-                "Error: Could not find diagram file '%s' on path '%s'",
-                src,
-                path,
-            )
-            diagram_xml = etree.fromstring("<invalid/>")
-
-        diagram = DrawioPlugin.parse_diagram(diagram_xml, page, src, path)
-        config["xml"] = diagram
-        return SUB_TEMPLATE.substitute(config=escape(json.dumps(config)))
 
     @staticmethod
     def parse_diagram(data, page, src="", path=None) -> str:
@@ -223,12 +220,21 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
 
     def on_config(self, config: MkDocsConfig) -> None:
         """Load embedded files"""
-        if not self.config.use_page_attribute and not self._has_attr_list_extension(
+        self.attr_list_enabled = self._has_attr_list_extension(
             config.get("markdown_extensions", [])
-        ):
+        )
+
+        # Check if plugin glightbox is enabled
+        if 'glightbox' in config["plugins"] and not self.attr_list_enabled:
             raise ConfigurationError(
                 "The markdown extension 'attr_list' must be enabled "
-                "when 'use_page_attribute' is set to false."
+                "when the 'glightbox' plugin is used."
+            )
+
+        if not self.config.use_page_attribute and not self.attr_list_enabled:
+            raise ConfigurationError(
+                "The markdown extension 'attr_list' must be enabled "
+                "when 'use_page_attribute' is enabled."
             )
 
         # Determine if we need to download the viewer JS
@@ -243,13 +249,8 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
 
         # Mandatory for reloading diagrams when navigating with
         # Mkdocs-Material which has an observable event listener
-        self.js.append("js/drawio-reload.js")
-
-        # Ensure that after the reload script, the darkmode script is loaded
-        # if following the current theme mode of the site is desired
-        if self.config.darkmode:
-            self.css.append("css/drawio-darkmode.css")
-            self.js.append("js/drawio-darkmode.js")
+        self.js.append("js/drawio-mkdocs.js")
+        self.css.append("css/drawio-darkmode.css")
 
         for path in self.css:
             config.extra_css.append(str(path))
@@ -280,7 +281,7 @@ class DrawioPlugin(BasePlugin[DrawioConfig]):
                     data = resp.read()
                 with open(dest, "wb") as f:
                     f.write(data)
-                LOGGER.info("Downloaded Drawio viewer to %s", dest)
+                LOGGER.debug("Downloaded Drawio viewer to %s", dest)
 
             except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout) as e:
                 LOGGER.warning(
